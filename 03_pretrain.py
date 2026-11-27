@@ -36,7 +36,7 @@ import mlx.optimizers as optim
 import mlx.utils as mlx_utils
 import numpy as np
 
-from model import PythiaConfig, build_model
+from model import MODEL_PRESETS, PythiaConfig, build_model, grow_model_depth, load_model_from_checkpoint
 
 
 def log(msg: str) -> None:
@@ -97,11 +97,24 @@ def main() -> None:
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--max-steps", type=int, default=0, help="override calibration (smoke tests)")
+    parser.add_argument("--size", choices=sorted(MODEL_PRESETS.keys()), default="", help="optional architecture preset (tiny/small/medium)")
     parser.add_argument("--hidden-size", type=int, default=384)
     parser.add_argument("--num-layers", type=int, default=6)
     parser.add_argument("--num-heads", type=int, default=6)
     parser.add_argument("--intermediate-size", type=int, default=1536)
+    parser.add_argument("--max-seq-len", type=int, default=1024)
+    parser.add_argument("--grow-from", default="", help="existing checkpoint to depth-grow and continue pretraining")
+    parser.add_argument("--target-layers", type=int, default=0, help="target layer count when using --grow-from")
+    parser.add_argument("--train-tokens", default="", help="override path to train_tokens.npy")
+    parser.add_argument("--valid-tokens", default="", help="override path to valid_tokens.npy")
     args = parser.parse_args()
+
+    if args.size:
+        preset = MODEL_PRESETS[args.size]
+        args.hidden_size = preset["hidden_size"]
+        args.num_layers = preset["num_hidden_layers"]
+        args.num_heads = preset["num_attention_heads"]
+        args.intermediate_size = preset["intermediate_size"]
 
     os.makedirs(args.checkpoints_dir, exist_ok=True)
     os.makedirs(args.artifacts_dir, exist_ok=True)
@@ -114,20 +127,30 @@ def main() -> None:
         tok_meta = json.load(f)
     vocab_size = int(tok_meta["vocab_size"])
 
-    train_tokens = np.load(os.path.join(args.data_dir, "train_tokens.npy"), mmap_mode="r")
-    valid_tokens = np.load(os.path.join(args.data_dir, "valid_tokens.npy"), mmap_mode="r")
+    train_tok_path = args.train_tokens or os.path.join(args.data_dir, "train_tokens.npy")
+    valid_tok_path = args.valid_tokens or os.path.join(args.data_dir, "valid_tokens.npy")
+    train_tokens = np.load(train_tok_path, mmap_mode="r")
+    valid_tokens = np.load(valid_tok_path, mmap_mode="r")
     log(f"tokens: train={len(train_tokens):,} valid={len(valid_tokens):,} vocab={vocab_size}")
 
-    config = PythiaConfig(
-        vocab_size=vocab_size,
-        hidden_size=args.hidden_size,
-        num_hidden_layers=args.num_layers,
-        num_attention_heads=args.num_heads,
-        intermediate_size=args.intermediate_size,
-        max_seq_len=512,
-        dtype="float32",
-    )
-    model = build_model(config, dtype="float32")
+    if args.grow_from:
+        src_model, src_cfg = load_model_from_checkpoint(args.grow_from, dtype="float32")
+        target_l = args.target_layers if args.target_layers > 0 else max(src_cfg.num_hidden_layers * 2, args.num_layers)
+        model, config = grow_model_depth(src_model, target_l)
+        config.max_seq_len = max(config.max_seq_len, args.max_seq_len)
+        log(f"grew checkpoint {args.grow_from}: {src_cfg.num_hidden_layers} -> {config.num_hidden_layers} layers")
+    else:
+        config = PythiaConfig(
+            vocab_size=vocab_size,
+            hidden_size=args.hidden_size,
+            num_hidden_layers=args.num_layers,
+            num_attention_heads=args.num_heads,
+            intermediate_size=args.intermediate_size,
+            max_seq_len=args.max_seq_len,
+            dtype="float32",
+        )
+        model = build_model(config, dtype="float32")
+    model.set_dtype(mx.float32)
     mx.eval(model.parameters())
     n_params = sum(v.size for _, v in mlx_utils.tree_flatten(model.parameters()))
     log(

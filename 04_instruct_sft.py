@@ -19,6 +19,7 @@ import json
 import math
 import os
 import time
+from collections import Counter
 from functools import partial
 from typing import Dict, List, Optional, Tuple
 
@@ -31,9 +32,25 @@ from tokenizers import Tokenizer
 
 from model import PythiaConfig, build_model, load_model_from_checkpoint, _masked_cross_entropy
 
+SPECIAL_TOKENS = ["<|endoftext|>", "<|padding|>", "<|user|>", "<|assistant|>"]
+
 
 def log(msg: str) -> None:
     print(f"[04 {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def verify_tokenizer(tok: Tokenizer) -> Dict[str, int]:
+    """Fail loudly if the special tokens are not exact single-token ids."""
+    ids: Dict[str, int] = {}
+    for special in SPECIAL_TOKENS:
+        idx = tok.token_to_id(special)
+        if idx is None:
+            raise SystemExit(f"tokenizer is missing special token {special!r}")
+        enc = tok.encode(special, add_special_tokens=False).ids
+        if enc != [idx]:
+            raise SystemExit(f"{special!r} is not a single token: id={idx}, encode={enc}")
+        ids[special] = idx
+    return ids
 
 
 def lr_at(step: int, total_steps: int, peak_lr: float, warmup: int, min_ratio: float = 0.1) -> float:
@@ -70,20 +87,34 @@ def build_dataset(
     seq_len: int,
 ) -> List[Dict[str, np.ndarray]]:
     pad_id = tok.token_to_id("<|padding|>")
+    eos_id = tok.token_to_id("<|endoftext|>")
     data: List[Dict[str, np.ndarray]] = []
     skipped = 0
-    for row in rows:
-        prompt_ids = tok.encode(row["prompt"], add_special_tokens=False).ids
-        resp_ids = tok.encode(row["response"], add_special_tokens=False).ids
+    for idx, row in enumerate(rows):
+        prompt = row.get("prompt", "")
+        response = row.get("response", "")
+        if not prompt.startswith("<|user|>\n") or "\n<|assistant|>\n" not in prompt:
+            raise ValueError(f"row {idx} does not use the chat prompt template: {prompt[:80]!r}")
+        if not response.strip().endswith("<|endoftext|>"):
+            raise ValueError(f"row {idx} response does not end with <|endoftext|>")
+
+        prompt_ids = tok.encode(prompt, add_special_tokens=False).ids
+        resp_ids = tok.encode(response, add_special_tokens=False).ids
+        # Be robust to a missing/odd terminator: the model must learn to stop.
+        if not resp_ids or resp_ids[-1] != eos_id:
+            resp_ids = resp_ids + [eos_id]
         if len(resp_ids) < 2:
             skipped += 1
             continue
         if len(prompt_ids) >= seq_len:
             prompt_ids = prompt_ids[: seq_len - 1]
-        resp_ids = resp_ids[: seq_len - len(prompt_ids)]
-        if not resp_ids:
+        room = seq_len - len(prompt_ids)
+        if room <= 1:
             skipped += 1
             continue
+        if len(resp_ids) > room:
+            # Keep the response head and, crucially, the EOS token.
+            resp_ids = resp_ids[: room - 1] + [eos_id]
         input_ids = prompt_ids + resp_ids
         labels = [-100] * len(prompt_ids) + resp_ids
         pad = seq_len - len(input_ids)
@@ -94,6 +125,7 @@ def build_dataset(
             {
                 "input_ids": np.asarray(input_ids, dtype=np.int32),
                 "labels": np.asarray(labels, dtype=np.int32),
+                "sample_weight": float(row.get("sample_weight", 1.0)),
             }
         )
     log(f"tokenized {len(data):,} examples (skipped {skipped})")
@@ -107,9 +139,12 @@ def main() -> None:
     parser.add_argument("--checkpoints-dir", default="checkpoints/instruct")
     parser.add_argument("--base-checkpoint", default="checkpoints/pretrain/base_final.safetensors")
     parser.add_argument("--config", default="checkpoints/pretrain/config.json")
+    parser.add_argument("--train-file", default="", help="default: data/sft_train_v2.jsonl, then instruct_train.jsonl")
+    parser.add_argument("--valid-file", default="", help="default: data/sft_valid_v2.jsonl, then instruct_valid.jsonl")
     parser.add_argument("--minutes", type=float, default=6.0)
-    parser.add_argument("--seq-len", type=int, default=512)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--seq-len", type=int, default=1024)
+    parser.add_argument("--max-seq-len", type=int, default=1024, help="model context window stored in config.json")
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--warmup-frac", type=float, default=0.05)
@@ -129,7 +164,11 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
 
     tok = Tokenizer.from_file(os.path.join(args.artifacts_dir, "tokenizer.json"))
+    special_ids = verify_tokenizer(tok)
+    log(f"special token ids: {special_ids}")
+
     config = PythiaConfig.load(args.config)
+    config.max_seq_len = max(int(args.max_seq_len), int(args.seq_len))
     model = build_model(config, dtype="float32")
     model.load_weights_from(args.base_checkpoint)
     # Checkpoints are stored as bf16.  Cast back to fp32 before creating the
@@ -138,12 +177,28 @@ def main() -> None:
     mx.eval(model.parameters())
     log(f"loaded base checkpoint {args.base_checkpoint} (fp32 training)")
 
-    train_rows = load_jsonl(os.path.join(args.data_dir, "instruct_train.jsonl"))
-    valid_rows = load_jsonl(os.path.join(args.data_dir, "instruct_valid.jsonl"))
+    train_path = args.train_file or os.path.join(args.data_dir, "sft_train_v2.jsonl")
+    if not os.path.exists(train_path):
+        train_path = os.path.join(args.data_dir, "instruct_train.jsonl")
+    valid_path = args.valid_file or os.path.join(args.data_dir, "sft_valid_v2.jsonl")
+    if not os.path.exists(valid_path):
+        valid_path = os.path.join(args.data_dir, "instruct_valid.jsonl")
+    log(f"train file: {train_path}")
+    log(f"valid file: {valid_path}")
+
+    train_rows = load_jsonl(train_path)
+    valid_rows = load_jsonl(valid_path) if os.path.exists(valid_path) else []
     train_data = build_dataset(train_rows, tok, args.seq_len)
     valid_data = build_dataset(valid_rows, tok, args.seq_len)
     if not train_data:
         raise SystemExit("no training examples")
+
+    task_counts = Counter(r.get("task", "unknown") for r in train_rows)
+    effective_weight = sum(float(r.get("sample_weight", 1.0)) for r in train_rows)
+    log(f"train mix: {dict(task_counts)}")
+    log(f"effective sampling weight: {effective_weight:,.0f} examples/epoch")
+    sample_weights = np.asarray([float(r["sample_weight"]) for r in train_data], dtype=np.float64)
+    sample_weights /= sample_weights.sum()
 
     optimizer = optim.AdamW(
         learning_rate=args.lr,
@@ -168,9 +223,17 @@ def main() -> None:
         optimizer.update(model, grads)
         return loss
 
-    def get_batch(data: List[Dict[str, np.ndarray]], batch_size: int, indices: Optional[np.ndarray] = None):
+    def get_batch(
+        data: List[Dict[str, np.ndarray]],
+        batch_size: int,
+        indices: Optional[np.ndarray] = None,
+        weights: Optional[np.ndarray] = None,
+    ):
         if indices is None:
-            indices = rng.integers(0, len(data), size=batch_size)
+            if weights is not None:
+                indices = rng.choice(len(data), size=batch_size, p=weights)
+            else:
+                indices = rng.integers(0, len(data), size=batch_size)
         x = np.stack([data[int(i)]["input_ids"] for i in indices])
         y = np.stack([data[int(i)]["labels"] for i in indices])
         return mx.array(x), mx.array(y)
@@ -203,7 +266,7 @@ def main() -> None:
     t_bench = time.time()
     loss = mx.array(0.0)
     for _ in range(bench_steps):
-        x, y = get_batch(train_data, args.batch_size)
+        x, y = get_batch(train_data, args.batch_size, weights=sample_weights)
         loss = train_step(x, y, mx.array(args.lr * 0.5, dtype=mx.float32))
         mx.eval(loss, state)
     bench_dt = max(time.time() - t_bench, 1e-6)
@@ -224,7 +287,7 @@ def main() -> None:
     tokens_processed = bench_steps * args.batch_size * args.seq_len
     for step in range(bench_steps, total_steps):
         lr = lr_at(step, total_steps, args.lr, warmup, args.min_lr_ratio)
-        x, y = get_batch(train_data, args.batch_size)
+        x, y = get_batch(train_data, args.batch_size, weights=sample_weights)
         loss = train_step(x, y, mx.array(lr, dtype=mx.float32))
         mx.eval(loss, state)
         tokens_processed += args.batch_size * args.seq_len

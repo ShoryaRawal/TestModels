@@ -20,9 +20,12 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
 from model import (
     PythiaConfig,
+    batched_generate,
     build_model,
     generate,
+    grow_model_depth,
     load_model_from_checkpoint,
+    sequence_logprobs,
     _masked_cross_entropy,
 )
 
@@ -125,7 +128,24 @@ def main() -> None:
     )
     text = generate(model, tok, "<|user|>\nhello\n<|assistant|>\n", max_new_tokens=5, seed=1)
     assert isinstance(text, str)
-    print(f"tokenizer + KV-cached generation OK: {text!r}")
+    roll = batched_generate(
+        model, tok, "<|user|>\nhello\n<|assistant|>\n",
+        num_samples=3, max_new_tokens=5, seed=1,
+    )
+    assert len(roll["texts"]) == 3 and len(roll["gen_ids"]) == 3
+    lp = sequence_logprobs(model, x)
+    mx.eval(lp)
+    assert lp.shape == (B, T - 1) and bool(mx.all(mx.isfinite(lp)))
+
+    # Function-preserving depth growth (2 -> 4 layers).
+    base_logits = model(x)
+    grown, grown_cfg = grow_model_depth(model, target_layers=4)
+    grown_logits = grown(x)
+    mx.eval(base_logits, grown_logits)
+    grow_diff = float(mx.max(mx.abs(base_logits - grown_logits)))
+    assert grown_cfg.num_hidden_layers == 4 and grow_diff < 1e-4, grow_diff
+    print(f"depth growth (2->4 layers) OK (step-0 max diff {grow_diff:.6f})")
+    print(f"tokenizer + KV-cached + batched generation + logprobs OK: {text!r}")
     print("SMOKE OK")
 
 

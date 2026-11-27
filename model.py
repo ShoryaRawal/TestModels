@@ -38,6 +38,27 @@ DTYPE_MAP = {
     "bfloat16": mx.bfloat16,
 }
 
+MODEL_PRESETS: Dict[str, Dict[str, int]] = {
+    "tiny": {
+        "hidden_size": 384,
+        "num_hidden_layers": 6,
+        "num_attention_heads": 6,
+        "intermediate_size": 1536,
+    },
+    "small": {
+        "hidden_size": 512,
+        "num_hidden_layers": 10,
+        "num_attention_heads": 8,
+        "intermediate_size": 2048,
+    },
+    "medium": {
+        "hidden_size": 768,
+        "num_hidden_layers": 12,
+        "num_attention_heads": 12,
+        "intermediate_size": 3072,
+    },
+}
+
 
 @dataclass
 class PythiaConfig:
@@ -48,7 +69,7 @@ class PythiaConfig:
     num_hidden_layers: int = 6
     num_attention_heads: int = 6
     intermediate_size: int = 1536
-    max_seq_len: int = 512
+    max_seq_len: int = 1024
     rotary_pct: float = 0.25
     rotary_base: float = 10000.0
     layer_norm_eps: float = 1e-5
@@ -453,6 +474,63 @@ def load_model_from_checkpoint(
     return model, config
 
 
+def grow_model_depth(
+    src_model: PythiaForCausalLM,
+    target_layers: int,
+) -> Tuple[PythiaForCausalLM, PythiaConfig]:
+    """Expand ``src_model`` to ``target_layers`` while preserving step-0 logits.
+
+    New blocks are interleaved after existing blocks with ``q/k/v/up`` and
+    LayerNorms copied from the preceding block and residual output projections
+    (``attention.dense`` and ``mlp.dense_4h_to_h``) zero-initialized so each
+    added block computes ``x + 0 + 0 = x`` initially while gradients flow cleanly.
+    """
+    src_cfg = src_model.config
+    if target_layers < src_cfg.num_hidden_layers:
+        raise ValueError(f"target_layers ({target_layers}) must be >= {src_cfg.num_hidden_layers}")
+    if target_layers == src_cfg.num_hidden_layers:
+        return src_model, src_cfg
+
+    new_cfg = PythiaConfig.from_dict({**src_cfg.to_dict(), "num_hidden_layers": int(target_layers)})
+    dst_model = build_model(new_cfg, dtype="float32")
+    src_params = dict(mlx_utils.tree_flatten(src_model.parameters()))
+    dst_params: Dict[str, mx.array] = {}
+
+    for k, v in src_params.items():
+        if not k.startswith("layers."):
+            dst_params[k] = mx.array(v, dtype=mx.float32)
+
+    src_n = src_cfg.num_hidden_layers
+    extra = target_layers - src_n
+    # Assign how many identity blocks follow each source block.
+    extra_per_block = [extra // src_n + (1 if i < (extra % src_n) else 0) for i in range(src_n)]
+
+    dst_idx = 0
+    for src_idx in range(src_n):
+        prefix_s = f"layers.{src_idx}."
+        prefix_d = f"layers.{dst_idx}."
+        for k, v in src_params.items():
+            if k.startswith(prefix_s):
+                dst_params[prefix_d + k[len(prefix_s) :]] = mx.array(v, dtype=mx.float32)
+        dst_idx += 1
+
+        for _ in range(extra_per_block[src_idx]):
+            prefix_new = f"layers.{dst_idx}."
+            for k, v in src_params.items():
+                if k.startswith(prefix_s):
+                    suffix = k[len(prefix_s) :]
+                    if suffix in ("attention.dense.weight", "mlp.dense_4h_to_h.weight"):
+                        dst_params[prefix_new + suffix] = mx.zeros_like(v, dtype=mx.float32)
+                    else:
+                        dst_params[prefix_new + suffix] = mx.array(v, dtype=mx.float32)
+            dst_idx += 1
+
+    dst_model.load_weights(list(dst_params.items()))
+    dst_model.set_dtype(mx.float32)
+    mx.eval(dst_model.parameters())
+    return dst_model, new_cfg
+
+
 # ----------------------------------------------------------------------
 # Sampling / generation
 # ----------------------------------------------------------------------
@@ -466,8 +544,15 @@ def generate(
     ablate_heads: Optional[Dict[int, Sequence[int]]] = None,
     seed: Optional[int] = None,
     repetition_penalty: float = 1.0,
+    stop_token_ids: Optional[Sequence[int]] = None,
 ) -> str:
-    """Simple KV-cached sampler for the interactive instruction model."""
+    """Simple KV-cached sampler for the interactive instruction model.
+
+    Sampling always stops at ``<|endoftext|>``.  Extra stop ids (for example
+    ``<|user|>`` so a model never role-plays the next turn) can be supplied via
+    ``stop_token_ids``.  The prompt is clipped from the left if it would exceed
+    the model's context window, and generation is capped to the remaining room.
+    """
     if seed is not None:
         mx.random.seed(seed)
 
@@ -475,6 +560,18 @@ def generate(
     eos_id = tokenizer.token_to_id("<|endoftext|>")
     if not ids:
         ids = [eos_id]
+
+    stop_ids = {int(eos_id)}
+    if stop_token_ids:
+        stop_ids.update(int(i) for i in stop_token_ids)
+
+    max_ctx = getattr(getattr(model, "config", None), "max_seq_len", None)
+    if max_ctx:
+        if len(ids) >= max_ctx:
+            ids = ids[-(max_ctx - 1) :]
+        max_new_tokens = min(max_new_tokens, max(0, max_ctx - len(ids)))
+    if max_new_tokens <= 0:
+        return ""
 
     logits, past = model(
         mx.array([ids], dtype=mx.int32),
@@ -506,7 +603,7 @@ def generate(
 
         mx.eval(next_id)
         nid = int(next_id)
-        if nid == eos_id:
+        if nid in stop_ids:
             break
         out_ids.append(nid)
         recent.append(nid)
@@ -519,6 +616,122 @@ def generate(
         mx.eval(logits)
 
     return tokenizer.decode(out_ids)
+
+
+def batched_generate(
+    model: PythiaForCausalLM,
+    tokenizer,
+    prompt: str,
+    num_samples: int = 4,
+    max_new_tokens: int = 96,
+    temperature: float = 0.85,
+    top_k: int = 40,
+    seed: Optional[int] = None,
+    stop_token_ids: Optional[Sequence[int]] = None,
+) -> Dict[str, Any]:
+    """Generate ``num_samples`` KV-cached completions in parallel for one prompt.
+
+    Prefills the prompt once and tiles the KV cache across ``num_samples``.
+    Returns a dict with ``prompt_ids`` (list[int]), ``gen_ids`` (list[list[int]]
+    including at most one terminating stop token if emitted), and ``texts``
+    (list[str] decoded without stop tokens).
+    """
+    if seed is not None:
+        mx.random.seed(seed)
+
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False).ids
+    eos_id = int(tokenizer.token_to_id("<|endoftext|>"))
+    if not prompt_ids:
+        prompt_ids = [eos_id]
+
+    stop_set = {eos_id}
+    if stop_token_ids:
+        stop_set.update(int(i) for i in stop_token_ids)
+
+    max_ctx = getattr(getattr(model, "config", None), "max_seq_len", None)
+    if max_ctx:
+        if len(prompt_ids) >= max_ctx:
+            prompt_ids = prompt_ids[-(max_ctx - 1) :]
+        max_new_tokens = min(max_new_tokens, max(0, max_ctx - len(prompt_ids)))
+    if max_new_tokens <= 0:
+        return {
+            "prompt_ids": prompt_ids,
+            "gen_ids": [[] for _ in range(num_samples)],
+            "texts": ["" for _ in range(num_samples)],
+        }
+
+    # Prefill prompt once (B=1), then tile KV cache to B=num_samples.
+    logits, past = model(mx.array([prompt_ids], dtype=mx.int32), use_kv_cache=True)
+    mx.eval(logits)
+    step_logits_1 = logits[0, -1, :].astype(mx.float32)
+    step_logits = mx.repeat(step_logits_1[None, :], num_samples, axis=0)
+    past = [
+        {
+            "k": mx.repeat(layer_kv["k"], num_samples, axis=0),
+            "v": mx.repeat(layer_kv["v"], num_samples, axis=0),
+        }
+        for layer_kv in past
+    ]
+
+    gen_ids: List[List[int]] = [[] for _ in range(num_samples)]
+    text_ids: List[List[int]] = [[] for _ in range(num_samples)]
+    finished = [False] * num_samples
+
+    for _ in range(max_new_tokens):
+        if temperature <= 1e-5:
+            next_ids = mx.argmax(step_logits, axis=-1)
+        else:
+            scaled = step_logits / temperature
+            if top_k and top_k > 0:
+                k = min(int(top_k), scaled.shape[-1])
+                thresh = mx.topk(scaled, k, axis=-1)[:, -1:]
+                scaled = mx.where(scaled < thresh, -1e9, scaled)
+            next_ids = mx.random.categorical(scaled)
+
+        mx.eval(next_ids)
+        picked = np.array(next_ids).tolist()
+        feed = []
+        for i, nid in enumerate(picked):
+            nid = int(nid)
+            if finished[i]:
+                feed.append(eos_id)
+                continue
+            gen_ids[i].append(nid)
+            if nid in stop_set:
+                finished[i] = True
+            else:
+                text_ids[i].append(nid)
+            feed.append(nid)
+
+        if all(finished):
+            break
+
+        logits, past = model(
+            mx.array(feed, dtype=mx.int32)[:, None],
+            past_kv=past,
+            use_kv_cache=True,
+        )
+        mx.eval(logits)
+        step_logits = logits[:, -1, :].astype(mx.float32)
+
+    texts = [tokenizer.decode(ids) for ids in text_ids]
+    return {
+        "prompt_ids": prompt_ids,
+        "gen_ids": gen_ids,
+        "texts": texts,
+    }
+
+
+def sequence_logprobs(model: PythiaForCausalLM, input_ids: mx.array) -> mx.array:
+    """Compute per-token log probabilities for ``input_ids[:, 1:]``.
+
+    Returns an array of shape ``(B, T - 1)`` in float32.
+    """
+    logits = model(input_ids).astype(mx.float32)
+    pred_logits = logits[:, :-1, :]
+    log_probs = pred_logits - mx.logsumexp(pred_logits, axis=-1, keepdims=True)
+    targets = input_ids[:, 1:].astype(mx.int32)
+    return mx.take_along_axis(log_probs, targets[:, :, None], axis=-1).squeeze(-1)
 
 
 def format_chat_prompt(user_message: str) -> str:

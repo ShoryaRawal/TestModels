@@ -38,6 +38,31 @@ from model import (
     load_model_from_checkpoint,
 )
 
+SPECIAL_TOKENS = ["<|endoftext|>", "<|padding|>", "<|user|>", "<|assistant|>"]
+
+
+def verify_tokenizer(tok: Tokenizer) -> Dict[str, int]:
+    ids: Dict[str, int] = {}
+    for special in SPECIAL_TOKENS:
+        idx = tok.token_to_id(special)
+        if idx is None:
+            raise SystemExit(f"tokenizer is missing special token {special!r}")
+        enc = tok.encode(special, add_special_tokens=False).ids
+        if enc != [idx]:
+            raise SystemExit(f"{special!r} is not a single token: id={idx}, encode={enc}")
+        ids[special] = idx
+    return ids
+
+
+def stop_ids(tok: Tokenizer) -> List[int]:
+    """Always stop on EOS; also stop if the model tries to start a new turn."""
+    return [
+        tok.token_to_id("<|endoftext|>"),
+        tok.token_to_id("<|user|>"),
+        tok.token_to_id("<|assistant|>"),
+        tok.token_to_id("<|padding|>"),
+    ]
+
 
 class Reporter:
     def __init__(self, path: Optional[str]):
@@ -229,6 +254,7 @@ def ablation_report(
     prompt: str,
     rep: Reporter,
     max_new_tokens: int = 80,
+    stops: Sequence[int] = (),
 ) -> None:
     rep.emit("=" * 78)
     rep.emit("3. CAUSAL HEAD ABLATION")
@@ -268,10 +294,13 @@ def ablation_report(
 
     # Generation degradation (instruct model only; may be slow on base).
     try:
-        clean = generate(model, tok, prompt, max_new_tokens=max_new_tokens, temperature=0.7, top_k=40, seed=7)
+        clean = generate(
+            model, tok, prompt, max_new_tokens=max_new_tokens, temperature=0.7, top_k=40,
+            seed=7, stop_token_ids=stops,
+        )
         ablated_text = generate(
-            model, tok, prompt, max_new_tokens=max_new_tokens, temperature=0.7, top_k=40, seed=7,
-            ablate_heads=combined,
+            model, tok, prompt, max_new_tokens=max_new_tokens, temperature=0.7, top_k=40,
+            seed=7, ablate_heads=combined, stop_token_ids=stops,
         )
         rep.emit("")
         rep.emit("clean generation:")
@@ -291,43 +320,105 @@ def generation_report(model, tok: Tokenizer, rep: Reporter, max_new_tokens: int,
     rep.emit("=" * 78)
     rep.emit("4. SAMPLE GENERATIONS")
     rep.emit("=" * 78)
+    stops = stop_ids(tok)
     if instruct:
-        prompts = [
-            "<|user|>\nWrite a short story about a brave little robot.\n<|assistant|>\n",
-            "<|user|>\nWhat lesson does the story of the slow turtle teach?\n<|assistant|>\n",
-            "<|user|>\nSummarize this story in one sentence: A tiny bird was afraid to fly, but her friends cheered her on until she tried.\n<|assistant|>\n",
+        items = [
+            ("hello", format_chat_prompt("hello"), min(50, max_new_tokens), 0.7),
+            ("who are you?", format_chat_prompt("who are you?"), min(60, max_new_tokens), 0.7),
+            ("what", format_chat_prompt("what"), min(50, max_new_tokens), 0.7),
+            ("write a short story about a brave cat", format_chat_prompt("write a short story about a brave cat"), max_new_tokens, 0.8),
+            ("moral of the slow turtle story", format_chat_prompt("What lesson does the story of the slow turtle teach?"), min(60, max_new_tokens), 0.7),
+            ("one-sentence summary", format_chat_prompt("Summarize this story in one sentence: A tiny bird was afraid to fly, but her friends cheered her on until she tried."), min(60, max_new_tokens), 0.7),
         ]
     else:
-        prompts = [
-            "Once upon a time, there was a little girl named Lily who",
-            "The small dragon looked at the sky and",
-            "One day, a clever fox found a",
+        items = [
+            ("story continuation", "Once upon a time, there was a little girl named Lily who", max_new_tokens, 0.8),
+            ("story continuation", "The small dragon looked at the sky and", max_new_tokens, 0.8),
+            ("story continuation", "One day, a clever fox found a", max_new_tokens, 0.8),
         ]
-    for prompt in prompts:
+    for label, prompt, n_tokens, temp in items:
         text = generate(
             model,
             tok,
             prompt,
-            max_new_tokens=max_new_tokens,
-            temperature=0.8,
+            max_new_tokens=n_tokens,
+            temperature=temp,
             top_k=40,
             seed=11,
+            stop_token_ids=stops,
         )
         rep.emit("")
-        rep.emit(f"prompt: {prompt!r}")
-        rep.emit(f"output: {text.strip()}")
+        rep.emit(f"prompt: {label!r}")
+        rep.emit(f"output: {text.strip() or '<empty>'}")
     rep.emit("")
 
 
 # ---------------------------------------------------------------------------
 # Interactive chat
 # ---------------------------------------------------------------------------
-def build_chat_prompt(history: Sequence[Tuple[str, str]], user: str) -> str:
-    parts = []
-    for u, a in history[-2:]:
-        parts.append(f"<|user|>\n{u}\n<|assistant|>\n{a}<|endoftext|>\n")
-    parts.append(f"<|user|>\n{user}\n<|assistant|>\n")
-    return "".join(parts)
+def build_chat_prompt(
+    history: Sequence[Tuple[str, str]],
+    user: str,
+    tok: Tokenizer,
+    max_seq_len: int,
+    max_new_tokens: int,
+) -> Tuple[str, Dict[str, int | bool]]:
+    """Format the next turn with the exact training template.
+
+    Old turns are dropped from the front until the prompt fits, and an oversized
+    current user message is token-truncated.  Returns ``(prompt, stats)``.
+    """
+    user = user.strip()
+    reserve = max(16, min(max_new_tokens, max_seq_len - 64))
+    budget = max(32, max_seq_len - reserve)
+
+    current = f"<|user|>\n{user}\n<|assistant|>\n"
+    was_trimmed = False
+    if len(tok.encode(current, add_special_tokens=False).ids) > budget:
+        overhead = len(tok.encode("<|user|>\n\n<|assistant|>\n", add_special_tokens=False).ids)
+        room = max(1, budget - overhead)
+        user_ids = tok.encode(user, add_special_tokens=False).ids
+        # Byte-level BPE boundaries can change the count after decoding, so
+        # shrink the user slice until the rebuilt prompt actually fits.
+        while room > 1:
+            user = tok.decode(user_ids[:room]).strip()
+            current = f"<|user|>\n{user}\n<|assistant|>\n"
+            if len(tok.encode(current, add_special_tokens=False).ids) <= budget:
+                break
+            room -= 1
+        was_trimmed = True
+
+    kept: List[Tuple[str, str]] = []
+    for u, a in reversed(history):
+        block = f"<|user|>\n{u.strip()}\n<|assistant|>\n{a.strip()}<|endoftext|>"
+        prefix = "".join(
+            f"<|user|>\n{uu.strip()}\n<|assistant|>\n{aa.strip()}<|endoftext|>"
+            for uu, aa in reversed(kept)
+        )
+        candidate = prefix + block + current
+        if len(tok.encode(candidate, add_special_tokens=False).ids) <= budget:
+            kept.append((u, a))
+        else:
+            break
+
+    parts = [
+        f"<|user|>\n{u.strip()}\n<|assistant|>\n{a.strip()}<|endoftext|>"
+        for u, a in reversed(kept)
+    ]
+    prompt = "".join(parts) + current
+    prompt_tokens = len(tok.encode(prompt, add_special_tokens=False).ids)
+    dropped = len(history) - len(kept)
+    stats: Dict[str, int | bool] = {
+        "prompt_tokens": prompt_tokens,
+        "budget": budget,
+        "max_seq_len": max_seq_len,
+        "reserve": reserve,
+        "kept_turns": len(kept),
+        "dropped_turns": dropped,
+        "trimmed": was_trimmed or dropped > 0,
+        "user_truncated": was_trimmed,
+    }
+    return prompt, stats
 
 
 def parse_ablation(text: str) -> Dict[int, List[int]]:
@@ -352,10 +443,12 @@ def parse_ablation(text: str) -> Dict[int, List[int]]:
     return ab
 
 
-def chat(model, tok: Tokenizer, args) -> None:
-    print("\nInteractive instruction model. Commands:")
+def chat(model, tok: Tokenizer, args, max_seq_len: int) -> None:
+    print(f"\nInteractive instruction model (context window: {max_seq_len} tokens). Commands:")
     print("  /quit              exit")
     print("  /reset             clear conversation history")
+    print("  /ctx               show context window usage and kept turns")
+    print("  /maxnew 120        set max new tokens reserved for replies")
     print("  /ablate 0:1,2 3:0  zero-ablate heads")
     print("  /clearablate       remove ablation")
     print("  /temp 0.7          set temperature")
@@ -364,6 +457,9 @@ def chat(model, tok: Tokenizer, args) -> None:
     ablation: Optional[Dict[int, List[int]]] = None
     temperature = args.temperature
     top_k = args.top_k
+    max_new_tokens = args.max_new_tokens
+    stops = stop_ids(tok)
+    last_stats: Optional[Dict[str, int | bool]] = None
     while True:
         try:
             user = input("you> ").strip()
@@ -376,7 +472,30 @@ def chat(model, tok: Tokenizer, args) -> None:
             break
         if user == "/reset":
             history = []
+            last_stats = None
             print("(history cleared)")
+            continue
+        if user == "/ctx":
+            reserve = max(16, min(max_new_tokens, max_seq_len - 64))
+            budget = max(32, max_seq_len - reserve)
+            hist_text = "".join(
+                f"<|user|>\n{u.strip()}\n<|assistant|>\n{a.strip()}<|endoftext|>"
+                for u, a in history
+            )
+            hist_tok = len(tok.encode(hist_text, add_special_tokens=False).ids) if hist_text else 0
+            print(
+                f"(window={max_seq_len} tok | prompt_budget={budget} | max_new={reserve} | "
+                f"history={len(history)} turns, {hist_tok} tok)"
+            )
+            for idx, (u, a) in enumerate(history, 1):
+                print(f"  [{idx}] you: {u[:60]!r} -> model: {a[:60]!r}")
+            continue
+        if user.startswith("/maxnew "):
+            try:
+                max_new_tokens = max(16, min(int(user.split()[1]), max_seq_len - 32))
+                print(f"(max_new_tokens = {max_new_tokens})")
+            except (IndexError, ValueError):
+                print("usage: /maxnew 120")
             continue
         if user == "/clearablate":
             ablation = None
@@ -401,31 +520,51 @@ def chat(model, tok: Tokenizer, args) -> None:
                 print("usage: /topk 40")
             continue
 
-        prompt = build_chat_prompt(history, user)
+        prompt, stats = build_chat_prompt(
+            history, user, tok, max_seq_len, max_new_tokens
+        )
+        if stats["user_truncated"]:
+            print("(current message truncated to fit context budget)")
+        elif stats["dropped_turns"]:
+            print(f"(trimmed {stats['dropped_turns']} oldest turn(s) to fit {stats['budget']}-token prompt budget)")
         t0 = time.time()
         reply = generate(
             model,
             tok,
             prompt,
-            max_new_tokens=args.max_new_tokens,
+            max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_k=top_k,
             ablate_heads=ablation,
             seed=None,
+            stop_token_ids=stops,
         ).strip()
         dt = time.time() - t0
-        print(f"model> {reply}\n        [{dt:.1f}s]\n")
+        if not reply:
+            reply = "(no reply)"
+        reply_tok = len(tok.encode(reply, add_special_tokens=False).ids)
+        total_tok = int(stats["prompt_tokens"]) + reply_tok
+        print(
+            f"model> {reply}\n"
+            f"        [{dt:.1f}s | ctx {total_tok}/{max_seq_len} tok "
+            f"(in {stats['prompt_tokens']}/{stats['budget']}, out {reply_tok}) | "
+            f"turns kept {int(stats['kept_turns']) + 1}]\n"
+        )
         history.append((user, reply))
+        last_stats = stats
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrain-dir", default="checkpoints/pretrain")
     parser.add_argument("--instruct-checkpoint", default="checkpoints/instruct/instruct_final.safetensors")
+    parser.add_argument("--rl-checkpoint", default="checkpoints/rl/rl_final.safetensors")
+    parser.add_argument("--use-sft", action="store_true", help="ignore rl_final.safetensors and load SFT checkpoint")
     parser.add_argument("--tokenizer", default="artifacts/tokenizer.json")
     parser.add_argument("--report", default="artifacts/interpretability_report.txt")
     parser.add_argument("--chat", action="store_true")
-    parser.add_argument("--max-new-tokens", type=int, default=140)
+    parser.add_argument("--max-new-tokens", type=int, default=120)
+    parser.add_argument("--context-len", type=int, default=0, help="override model max_seq_len for chat (e.g. 1024)")
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-k", type=int, default=40)
     parser.add_argument("--threshold", type=float, default=0.05)
@@ -436,13 +575,27 @@ def main() -> None:
     if not os.path.exists(args.tokenizer):
         raise SystemExit(f"missing tokenizer: {args.tokenizer}")
     tok = Tokenizer.from_file(args.tokenizer)
+    special_ids = verify_tokenizer(tok)
+    print(f"special token ids: {special_ids}")
+    stops = stop_ids(tok)
+
+    active_ckpt = args.instruct_checkpoint
+    if (
+        not args.use_sft
+        and args.instruct_checkpoint == "checkpoints/instruct/instruct_final.safetensors"
+        and os.path.exists(args.rl_checkpoint)
+    ):
+        active_ckpt = args.rl_checkpoint
 
     if args.chat:
-        if not os.path.exists(args.instruct_checkpoint):
-            raise SystemExit(f"missing instruct checkpoint: {args.instruct_checkpoint}")
-        model, config = load_model_from_checkpoint(args.instruct_checkpoint, dtype="float32")
-        print(f"loaded instruct model: {config.num_hidden_layers} layers, {config.hidden_size} hidden")
-        chat(model, tok, args)
+        if not os.path.exists(active_ckpt):
+            raise SystemExit(f"missing instruct checkpoint: {active_ckpt}")
+        model, config = load_model_from_checkpoint(active_ckpt, dtype="float32")
+        ctx_len = args.context_len if args.context_len > 0 else config.max_seq_len
+        config.max_seq_len = ctx_len
+        model.config.max_seq_len = ctx_len
+        print(f"loaded model ({active_ckpt}): {config.num_hidden_layers} layers, {config.hidden_size} hidden, ctx={ctx_len}")
+        chat(model, tok, args, ctx_len)
         return
 
     rep = Reporter(args.report)
@@ -478,9 +631,9 @@ def main() -> None:
         args.max_checkpoints,
     )
 
-    # Use the instruction model for the ablation demonstration when available.
-    if os.path.exists(args.instruct_checkpoint):
-        instr_model, _ = load_model_from_checkpoint(args.instruct_checkpoint, dtype="float32")
+    # Use the RL / instruction model for the ablation demonstration when available.
+    if os.path.exists(active_ckpt):
+        instr_model, _ = load_model_from_checkpoint(active_ckpt, dtype="float32")
         ablation_model = instr_model
         instruct = True
     else:
@@ -495,6 +648,7 @@ def main() -> None:
         ablation_prompt,
         rep,
         max_new_tokens=min(80, args.max_new_tokens),
+        stops=stops,
     )
     generation_report(ablation_model, tok, rep, min(120, args.max_new_tokens), instruct)
     rep.save()

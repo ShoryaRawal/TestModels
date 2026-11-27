@@ -80,34 +80,45 @@ run_step() {
 }
 
 # ---------------------------------------------------------------------------
-# Pipeline (Phase 1 ~26 min, Phase 2 ~6 min on an M1 16GB; calibrated live)
+# Pipeline (Phase 1 ~26 min, Phase 2 ~5 min on an M1 16GB; calibrated live)
 # ---------------------------------------------------------------------------
-run_step "1/5 fetch + synthesize data" \
+run_step "1/6 fetch + synthesize data" \
   "$PY" 01_fetch_data.py \
     --train-mb 150 \
     --num-instruct 15000 \
     --num-valid-instruct 500
 
-run_step "2/5 tokenizer + pre-tokenize" \
+run_step "2/6 tokenizer + pre-tokenize" \
   "$PY" 02_train_tokenizer.py \
     --vocab-size 8192 \
     --tokenizer-sample-mb 60
 
-run_step "3/5 base pretraining" \
+run_step "3/6 base pretraining" \
   "$PY" 03_pretrain.py \
     --minutes 26 \
     --seq-len 256 \
     --batch-size 32 \
     --lr 6e-4
 
-run_step "4/5 instruction SFT" \
-  "$PY" 04_instruct_sft.py \
-    --minutes 6 \
-    --seq-len 512 \
-    --batch-size 16 \
-    --lr 2e-4
+run_step "4/7 build mixed SFT data" \
+  "$PY" build_sft_data.py \
+    --conversational 5000 \
+    --valid-conversational 400
 
-run_step "5/5 interpretability lab" \
+run_step "5/7 instruction SFT" \
+  "$PY" 04_instruct_sft.py \
+    --minutes 5 \
+    --seq-len 1024 \
+    --max-seq-len 1024 \
+    --batch-size 8 \
+    --lr 1.5e-4
+
+run_step "6/7 RLVR learning loop (GRPO)" \
+  "$PY" 06_rl_loop.py \
+    --rounds 4 \
+    --steps-per-round 25
+
+run_step "7/7 interpretability lab" \
   "$PY" 05_interpretability_lab.py
 
 END_TS=$(date +%s)
@@ -128,6 +139,8 @@ echo "Final metrics:"
 tail -n 3 artifacts/pretrain_metrics.jsonl 2>/dev/null || true
 tail -n 3 artifacts/sft_metrics.jsonl 2>/dev/null || true
 echo ""
+echo "Check instruction behavior:"
+echo "  .venv/bin/python test_instruct.py"
 echo "Chat with the instruction model:"
 echo "  .venv/bin/python 05_interpretability_lab.py --chat"
 echo "Full report:"

@@ -18,9 +18,9 @@ HTTP, and the tokenizer is the standalone Rust `tokenizers` package.
 ./run_all.sh
 ```
 
-The script creates `.venv`, installs `requirements.txt`, and runs all five
+The script creates `.venv`, installs `requirements.txt`, and runs all six
 stages under `caffeinate -i`, teeing everything to `training.log`. On an M1
-16 GB the pipeline is calibrated to finish in roughly **35–40 minutes**.
+16 GB the pipeline is calibrated to finish in roughly **33–38 minutes**.
 
 When it finishes:
 
@@ -28,12 +28,21 @@ When it finishes:
 # read the research report
 open artifacts/interpretability_report.txt
 
-# talk to the instruction-tuned model
+# non-interactive behavior check
+.venv/bin/python test_instruct.py
+
+# run RLVR / GRPO learning loop with break-test evaluation
+.venv/bin/python 06_rl_loop.py
+
+# talk to the instruction / RL-tuned model
 .venv/bin/python 05_interpretability_lab.py --chat
 ```
 
-Chat commands: `/quit`, `/reset`, `/ablate 0:1,2 3:0`, `/clearablate`,
-`/temp 0.7`, `/topk 40`.
+Chat commands: `/quit`, `/reset`, `/ctx`, `/maxnew 120`, `/ablate 0:1,2 3:0`,
+`/clearablate`, `/temp 0.7`, `/topk 40`.  Chat formatting uses the exact training
+template, stops on `<|endoftext|>` or `<|user|>`, shows live token-window
+usage, and drops old turns when the encoded prompt would exceed
+`max_seq_len - max_new_tokens`.
 
 ---
 
@@ -45,8 +54,13 @@ Chat commands: `/quit`, `/reset`, `/ablate 0:1,2 3:0`, `/clearablate`,
 | `02_train_tokenizer.py` | trains an 8192-token byte-level BPE tokenizer and writes `uint16` `.npy` token arrays for zero-bottleneck batch loading. |
 | `model.py` | authentic GPT-NeoX: parallel attention/MLP residual, partial RoPE, untied embeddings, transparent forward mode, head ablation, safetensors I/O, KV-cached sampling. |
 | `03_pretrain.py` | from-scratch pretraining with `mx.compile`, AdamW, warmup + cosine decay, gradient clipping, live throughput calibration, and Pythia-style checkpoints. |
-| `04_instruct_sft.py` | instruction SFT with **prompt-masked loss** (cross entropy only on `<\|assistant\|> ... <\|endoftext\|>`). |
+| `build_sft_data.py` | mixes a balanced 6k TinyStories subset with ~5k conversational/general pairs: expanded capitals/facts, digit-by-digit scratchpad math, honest abstention, and grounded multi-turn recovery. |
+| `04_instruct_sft.py` | instruction SFT with **prompt-masked loss** (cross entropy only on `<\|assistant\|> ... <\|endoftext\|>`), weighted batch sampling, and exact-template checks. |
+| `06_rl_loop.py` | GRPO / RLVR learning loop with verifiable rewards (multi-digit math, factual QA, abstention on OOD queries, anti-repetition/multi-turn grounding, story preservation) and break-test failure mining. |
+| `07_fetch_open_web.py` | bounded, model-guided Wikipedia/SimpleWiki fetcher (strict MB/page cap, hard-capped at 100 MiB) that builds `open_web_train_tokens.npy` and `mixed_train_tokens.npy` (old TinyStories + open knowledge). |
+| `08_continual_volatility.py` | multi-cycle continual learning & volatility test mixing old TinyStories replay, open-web articles, SFT replay, and GRPO, with optional depth growth (`--grow-layers`). |
 | `05_interpretability_lab.py` | Logit Lens, induction-head developmental scanner, causal ablation with KL/logit-shift, sample generations, and `--chat`. |
+| `test_instruct.py` | non-interactive four-prompt check: greetings/clarifications stay direct, explicit story requests still write stories. |
 | `run_all.sh` | end-to-end driver with `caffeinate -i`, logging, timing, and a completion summary. |
 | `smoke_test.py` | 5-step architecture/training smoke test on synthetic data. |
 
@@ -56,14 +70,16 @@ Generated artifacts:
 data/
   pretrain_train.txt  pretrain_valid.txt
   instruct_train.jsonl  instruct_valid.jsonl
+  sft_train_v2.jsonl  sft_valid_v2.jsonl  sft_meta_v2.json
   train_tokens.npy  valid_tokens.npy
 artifacts/
   tokenizer.json  tokenizer_meta.json
-  pretrain_metrics.jsonl  sft_metrics.jsonl
-  interpretability_report.txt
+  pretrain_metrics.jsonl  sft_metrics.jsonl  rl_metrics.jsonl
+  rl_break_eval.json  interpretability_report.txt
 checkpoints/
   pretrain/step_0000 ... step_0512, step_1000, ..., base_final.safetensors
   instruct/instruct_final.safetensors
+  rl/rl_final.safetensors
 ```
 
 ---
@@ -91,7 +107,7 @@ hidden_size          384
 num_hidden_layers      6
 num_attention_heads    6   (head_dim 64, rotary_dim 16)
 intermediate_size   1536
-max_seq_len          512   (pretraining uses 256-token windows)
+max_seq_len         1024   (pretraining uses 256-token windows; RoPE extends cleanly)
 ```
 
 Weight initialization follows GPT-NeoX (`Normal(0, 0.02)`).
@@ -159,13 +175,46 @@ Measured on the target class of hardware (M1/M5, 16–21 GB unified memory):
 | data download + synthesis | — | 5–20 s |
 | tokenizer + pre-tokenization | 60 MB BPE sample | 30–90 s |
 | base pretraining | 26 min | **5,968 steps, 48.9M tokens, val loss 1.715** |
-| instruction SFT | 7 min | **1,213 steps, 9.9M tokens, val loss 1.696** |
+| mixed SFT data build | — | 10,007 rows, 18.1k effective weight |
+| instruction SFT | 5 min | ~850 steps, ~13.5M tokens |
 | interpretability report | — | 30–90 s |
 
 The first full run tokenized 150 MB into **38.29M tokens** (4.11 bytes/token)
 and processed **48.9M tokens** in 26 minutes: **1.28 epochs**. Throughput settled
 around 32–35k tokens/sec. Increase `--train-mb` downward if you want more passes;
 the calibration keeps wall-clock fixed.
+
+---
+
+## Conversational SFT mix
+
+A pure TinyStories SFT set teaches one dominant behavior: `"Once upon a time"`.
+`build_sft_data.py` keeps **6,000** balanced TinyStories examples (story writing,
+completion, one-sentence summary, moral extraction, and character Q&A) and adds
+**~4,000** short conversational/general-assistant pairs:
+
+- greetings and small talk (`hello`, `hi`, `how are you?`, `good morning`)
+- clarification/meta prompts (`what`, `huh`, `bro what`, `stop`, `no`)
+- direct Q&A and simple reasoning (math, counting, opposites, colors, animals,
+  spelling, plurals, simple facts, short reading comprehension)
+- explicit story requests, which are the only responses allowed to start with
+  `"Once upon a time"`
+
+Conversational rows carry `sample_weight=3.0`; the canonical greeting/clarification
+prompts carry `sample_weight=12.0` so exact phrasings are learned reliably.
+`04_instruct_sft.py` samples batches with those weights rather than duplicating
+rows on disk.
+
+Every row uses exactly:
+
+```
+<|user|>\n{user_message}\n<|assistant|>\n{response}<|endoftext|>
+```
+
+`04` asserts that the four special tokens are single ids, validates the template,
+and preserves the terminating EOS even if a long response is truncated. Inference
+stops on `<|endoftext|>` or `<|user|>`, and chat history is trimmed by token
+count so the prompt plus generation always fits the 512-token context.
 
 ---
 
